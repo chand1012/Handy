@@ -340,6 +340,10 @@ async fn maybe_convert_chinese_variant(
     }
 }
 
+fn apply_text_processing(transcription: &str) -> String {
+    text_processing_rs::normalize_sentence(transcription)
+}
+
 pub(crate) struct ProcessedTranscription {
     pub final_text: String,
     pub post_processed_text: Option<String>,
@@ -358,6 +362,19 @@ pub(crate) async fn process_transcription_output(
 
     if let Some(converted_text) = maybe_convert_chinese_variant(&settings, transcription).await {
         final_text = converted_text;
+    }
+
+    if settings.text_processing_enabled {
+        let processed_text = apply_text_processing(&final_text);
+        if processed_text != final_text {
+            debug!(
+                "Text processing completed. Input length: {}, Output length: {}",
+                final_text.len(),
+                processed_text.len()
+            );
+            final_text = processed_text;
+            post_processed_text = Some(final_text.clone());
+        }
     }
 
     if post_process {
@@ -719,3 +736,16 @@ pub static ACTION_MAP: Lazy<HashMap<String, Arc<dyn ShortcutAction>>> = Lazy::ne
     );
     map
 });
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn text_processing_converts_spoken_amounts_to_written_representation() {
+        assert_eq!(
+            apply_text_processing("I paid five dollars and fifty cents."),
+            "I paid $5.50."
+        );
+    }
+}
