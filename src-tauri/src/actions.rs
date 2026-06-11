@@ -344,6 +344,302 @@ fn apply_text_processing(transcription: &str) -> String {
     text_processing_rs::normalize_sentence(transcription)
 }
 
+fn apply_text_processing_if_useful(transcription: &str) -> Option<String> {
+    if let Some(processed_text) = normalize_spoken_digit_sequences(transcription) {
+        return Some(processed_text);
+    }
+
+    let processed_text = apply_text_processing(transcription);
+    if processed_text == transcription || !contains_ascii_digit(&processed_text) {
+        return None;
+    }
+
+    let spoken_stats = SpokenNumberStats::from_text(transcription);
+    let digit_token_count = count_digit_tokens(&processed_text);
+
+    let should_apply = contains_currency_or_decimal(&processed_text)
+        || has_long_digit_run(&processed_text)
+        || spoken_stats.longest_sequence >= 3
+        || (spoken_stats.span_count >= 2 && digit_token_count >= 2)
+        || (spoken_stats.word_count >= 2 && has_numeric_context(transcription));
+
+    should_apply.then_some(processed_text)
+}
+
+fn apply_text_processing_to_output(
+    final_text: &mut String,
+    post_processed_text: &mut Option<String>,
+) -> bool {
+    let original_len = final_text.len();
+    let Some(processed_text) = apply_text_processing_if_useful(final_text) else {
+        return false;
+    };
+
+    debug!(
+        "Text processing completed. Input length: {}, Output length: {}",
+        original_len,
+        processed_text.len()
+    );
+    *final_text = processed_text;
+    *post_processed_text = Some(final_text.clone());
+    true
+}
+
+fn normalize_spoken_digit_sequences(text: &str) -> Option<String> {
+    let mut replacements = Vec::new();
+    let mut sequence_start: Option<usize> = None;
+    let mut sequence_end = 0;
+    let mut sequence_digits = String::new();
+    let mut sequence_len = 0;
+
+    for (start, end, word) in iter_words(text) {
+        if let Some(digit) = spoken_digit(&word) {
+            if sequence_start.is_none() {
+                sequence_start = Some(start);
+            }
+            sequence_end = end;
+            sequence_digits.push(digit);
+            sequence_len += 1;
+        } else {
+            if let Some(start) = sequence_start {
+                if sequence_len >= 3 {
+                    replacements.push((start, sequence_end, sequence_digits.clone()));
+                }
+            }
+            sequence_start = None;
+            sequence_end = 0;
+            sequence_digits.clear();
+            sequence_len = 0;
+        }
+    }
+
+    if let Some(start) = sequence_start {
+        if sequence_len >= 3 {
+            replacements.push((start, sequence_end, sequence_digits));
+        }
+    }
+
+    if replacements.is_empty() {
+        return None;
+    }
+
+    let mut output = String::with_capacity(text.len());
+    let mut last_end = 0;
+    for (start, end, digits) in replacements {
+        output.push_str(&text[last_end..start]);
+        output.push_str(&digits);
+        last_end = end;
+    }
+    output.push_str(&text[last_end..]);
+
+    Some(output)
+}
+
+fn iter_words(text: &str) -> impl Iterator<Item = (usize, usize, String)> + '_ {
+    let mut words = Vec::new();
+    let mut start = None;
+
+    for (index, ch) in text.char_indices() {
+        if ch.is_ascii_alphabetic() {
+            start.get_or_insert(index);
+        } else if let Some(word_start) = start.take() {
+            words.push((
+                word_start,
+                index,
+                text[word_start..index].to_ascii_lowercase(),
+            ));
+        }
+    }
+
+    if let Some(word_start) = start {
+        words.push((
+            word_start,
+            text.len(),
+            text[word_start..].to_ascii_lowercase(),
+        ));
+    }
+
+    words.into_iter()
+}
+
+fn spoken_digit(token: &str) -> Option<char> {
+    match token {
+        "zero" | "oh" | "o" => Some('0'),
+        "one" => Some('1'),
+        "two" => Some('2'),
+        "three" => Some('3'),
+        "four" => Some('4'),
+        "five" => Some('5'),
+        "six" => Some('6'),
+        "seven" => Some('7'),
+        "eight" => Some('8'),
+        "nine" => Some('9'),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Default)]
+struct SpokenNumberStats {
+    span_count: usize,
+    word_count: usize,
+    longest_sequence: usize,
+}
+
+impl SpokenNumberStats {
+    fn from_text(text: &str) -> Self {
+        let mut stats = Self::default();
+        let mut in_span = false;
+        let mut current_sequence = 0;
+
+        for token in text
+            .split(|c: char| !c.is_ascii_alphabetic())
+            .filter(|token| !token.is_empty())
+            .map(|token| token.to_ascii_lowercase())
+        {
+            if is_spoken_number_token(&token) {
+                if !in_span {
+                    stats.span_count += 1;
+                    in_span = true;
+                }
+                stats.word_count += 1;
+                current_sequence += 1;
+                stats.longest_sequence = stats.longest_sequence.max(current_sequence);
+            } else {
+                in_span = false;
+                current_sequence = 0;
+            }
+        }
+
+        stats
+    }
+}
+
+fn is_spoken_number_token(token: &str) -> bool {
+    matches!(
+        token,
+        "zero"
+            | "oh"
+            | "o"
+            | "one"
+            | "two"
+            | "three"
+            | "four"
+            | "five"
+            | "six"
+            | "seven"
+            | "eight"
+            | "nine"
+            | "ten"
+            | "eleven"
+            | "twelve"
+            | "thirteen"
+            | "fourteen"
+            | "fifteen"
+            | "sixteen"
+            | "seventeen"
+            | "eighteen"
+            | "nineteen"
+            | "twenty"
+            | "thirty"
+            | "forty"
+            | "fifty"
+            | "sixty"
+            | "seventy"
+            | "eighty"
+            | "ninety"
+            | "hundred"
+            | "thousand"
+            | "million"
+            | "billion"
+            | "point"
+            | "dot"
+            | "dollar"
+            | "dollars"
+            | "cent"
+            | "cents"
+    )
+}
+
+fn contains_ascii_digit(text: &str) -> bool {
+    text.bytes().any(|byte| byte.is_ascii_digit())
+}
+
+fn count_digit_tokens(text: &str) -> usize {
+    text.split(|c: char| !c.is_ascii_digit())
+        .filter(|token| !token.is_empty())
+        .count()
+}
+
+fn contains_currency_or_decimal(text: &str) -> bool {
+    if text.contains('$') || text.contains('%') {
+        return true;
+    }
+
+    text.as_bytes()
+        .windows(3)
+        .any(|window| window[0].is_ascii_digit() && window[1] == b'.' && window[2].is_ascii_digit())
+}
+
+fn has_long_digit_run(text: &str) -> bool {
+    let mut current = 0;
+    for byte in text.bytes() {
+        if byte.is_ascii_digit() {
+            current += 1;
+            if current >= 3 {
+                return true;
+            }
+        } else {
+            current = 0;
+        }
+    }
+    false
+}
+
+fn has_numeric_context(text: &str) -> bool {
+    const CONTEXT_WORDS: &[&str] = &[
+        "amount",
+        "amounts",
+        "code",
+        "codes",
+        "decimal",
+        "decimals",
+        "degree",
+        "degrees",
+        "dollar",
+        "dollars",
+        "hour",
+        "hours",
+        "kilogram",
+        "kilograms",
+        "mile",
+        "miles",
+        "minute",
+        "minutes",
+        "number",
+        "numbers",
+        "percent",
+        "percentage",
+        "pin",
+        "pixel",
+        "pixels",
+        "pound",
+        "pounds",
+        "second",
+        "seconds",
+        "timeout",
+        "total",
+        "totals",
+        "value",
+        "values",
+        "version",
+    ];
+
+    text.split(|c: char| !c.is_ascii_alphabetic())
+        .filter(|token| !token.is_empty())
+        .map(|token| token.to_ascii_lowercase())
+        .any(|token| CONTEXT_WORDS.contains(&token.as_str()))
+}
+
 pub(crate) struct ProcessedTranscription {
     pub final_text: String,
     pub post_processed_text: Option<String>,
@@ -365,16 +661,7 @@ pub(crate) async fn process_transcription_output(
     }
 
     if settings.text_processing_enabled {
-        let processed_text = apply_text_processing(&final_text);
-        if processed_text != final_text {
-            debug!(
-                "Text processing completed. Input length: {}, Output length: {}",
-                final_text.len(),
-                processed_text.len()
-            );
-            final_text = processed_text;
-            post_processed_text = Some(final_text.clone());
-        }
+        apply_text_processing_to_output(&mut final_text, &mut post_processed_text);
     }
 
     if post_process {
@@ -747,5 +1034,77 @@ mod tests {
             apply_text_processing("I paid five dollars and fifty cents."),
             "I paid $5.50."
         );
+    }
+
+    #[test]
+    fn text_processing_rejects_single_number_in_ordinary_prose() {
+        let examples = [
+            "Analyze why one of the CI jobs failed and figure out what you need to do to fix it.",
+            "Pick one of the options and explain your reasoning.",
+            "This is one way to solve the problem.",
+            "I have one question about the pull request.",
+            "Mark this as priority two if it looks risky.",
+        ];
+
+        for example in examples {
+            assert_eq!(apply_text_processing_if_useful(example), None);
+        }
+    }
+
+    #[test]
+    fn text_processing_accepts_high_confidence_numeric_conversions() {
+        let examples = [
+            ("I paid five dollars and fifty cents.", "I paid $5.50."),
+            (
+                "The code is one two three four five six.",
+                "The code is 123456.",
+            ),
+            (
+                "Set the timeout to one hundred twenty seconds.",
+                "Set the timeout to 120 seconds.",
+            ),
+            (
+                "The values are five, ten, and twenty five.",
+                "The values are 5, 10, 25.",
+            ),
+        ];
+
+        for (input, expected) in examples {
+            assert_eq!(
+                apply_text_processing_if_useful(input),
+                Some(expected.to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn text_processing_output_helper_leaves_rejected_text_unchanged() {
+        let mut final_text =
+            "Analyze why one of the CI jobs failed and figure out what you need to do to fix it."
+                .to_string();
+        let mut post_processed_text = None;
+
+        assert!(!apply_text_processing_to_output(
+            &mut final_text,
+            &mut post_processed_text
+        ));
+        assert_eq!(
+            final_text,
+            "Analyze why one of the CI jobs failed and figure out what you need to do to fix it."
+        );
+        assert_eq!(post_processed_text, None);
+    }
+
+    #[test]
+    fn text_processing_output_helper_stores_accepted_text() {
+        let mut final_text = "I paid five dollars and fifty cents.".to_string();
+        let mut post_processed_text = None;
+
+        assert!(apply_text_processing_to_output(
+            &mut final_text,
+            &mut post_processed_text
+        ));
+        assert_eq!(final_text, "I paid $5.50.");
+        assert_eq!(post_processed_text, Some("I paid $5.50.".to_string()));
     }
 }
